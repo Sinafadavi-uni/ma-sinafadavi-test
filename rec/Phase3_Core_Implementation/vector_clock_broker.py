@@ -40,7 +40,14 @@ from rec.Phase1_Core_Foundation.causal_consistency import CausalConsistencyManag
 phase2_path = os.path.join(os.path.dirname(__file__), '..', 'Phase2_Node_Infrastructure')
 sys.path.insert(0, phase2_path)
 
-from rec.Phase2_Node_Infrastructure.executorbroker import ExecutorBroker, JobInfo, ExecutorInfo
+# Use the extended broker (with metadata replication + redeploy)
+from rec.Phase2_Node_Infrastructure.extended_executorbroker import (
+    ExtendedExecutorBroker as ExecutorBroker,
+    JobInfo as JobInfo,        # keep name in this file
+)
+from rec.Phase2_Node_Infrastructure.executorbroker import ExecutorInfo
+
+
 
 LOG = logging.getLogger(__name__)
 
@@ -60,10 +67,10 @@ class DistributedJobCoordination:
     emergency_priority: Optional[int] = None
     coordination_state: str = "pending"
     assigned_executor: Optional[str] = None
-
 class VectorClockBroker(ExecutorBroker):
-    def __init__(self, broker_id: str = None):
-        super().__init__(broker_id)
+    def __init__(self, broker_id: str = None, replication_policy_manager=None):
+        # pass the replication policy manager down to the extended broker
+        super().__init__(broker_id, replication_policy_manager=replication_policy_manager)
         self.coordination_state = BrokerCoordinationState.INITIALIZING
         self.coordination_lock = threading.RLock()
         self.peer_brokers: Dict[str, 'VectorClockBroker'] = {}
@@ -79,6 +86,10 @@ class VectorClockBroker(ExecutorBroker):
 
     def register_peer_broker(self, peer_id: str, peer_broker: 'VectorClockBroker') -> None:
         self.peer_brokers[peer_id] = peer_broker
+        try:
+            self.metadata_peers = list(self.peer_brokers.values())
+        except Exception:
+            pass
         LOG.info(f"Registered peer broker: {peer_id}")
 
     def submit_distributed_job(self, job_info: JobInfo, preferred_broker: str = None) -> UUID:
@@ -203,14 +214,23 @@ class VectorClockBroker(ExecutorBroker):
         }
 
     def start(self) -> None:
-        super().start()
-        if self.sync_thread is None or not self.sync_thread.is_alive():
-            self.sync_thread = threading.Thread(
-                target=self._coordination_sync_worker,
-                daemon=True,
-                name=f"vc-broker-sync-{self.broker_id}"
-            )
-            self.sync_thread.start()
+    # Build metadata peers list for ExtendedExecutorBroker
+        try:
+        # self.peer_brokers is dict[str, VectorClockBroker]; we need the objects
+            self.metadata_peers = list(self.peer_brokers.values())
+        except Exception:
+            self.metadata_peers = []
+
+    # IMPORTANT: call super().start() AFTER preparing metadata_peers
+    super().start()
+
+    if self.sync_thread is None or not self.sync_thread.is_alive():
+        self.sync_thread = threading.Thread(
+            target=self._coordination_sync_worker,
+            daemon=True,
+            name=f"vc-broker-sync-{self.broker_id}"
+        )
+        self.sync_thread.start()
         self.coordination_state = BrokerCoordinationState.ACTIVE
         LOG.info(f"VectorClockBroker {self.broker_id} started with distributed coordination")
 
